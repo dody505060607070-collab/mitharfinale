@@ -4,9 +4,9 @@ import { z } from "zod";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 
 /**
- * إرسال واتساب مباشرة عبر Twilio (بدون فتح wa.me).
- * السرّيات: TWILIO_ACCOUNT_SID + TWILIO_AUTH_TOKEN + TWILIO_WHATSAPP_FROM
- * واختياريًا TWILIO_CONTENT_SID للقالب المعتمد خارج نافذة الـ 24 ساعة.
+ * إرسال واتساب عبر Evolution API (instance مستقلة لهذا الموقع).
+ * الأسرار: WHATSAPP_API_URL + WHATSAPP_API_KEY + WHATSAPP_INSTANCE
+ * ويبقى Twilio كخيار احتياطي إن توفرت بياناته.
  */
 
 /** يحوّل رقمًا سعوديًا محليًا (05xxxxxxxx) إلى صيغة +966xxxxxxxx. */
@@ -24,41 +24,89 @@ type TwilioResult =
   | { ok: true; sid: string }
   | { ok: false; error: string; needsTemplate?: boolean };
 
-function normalizeBridgeConfig() {
-  const rawUrl = process.env["WHATSAPP_BRIDGE_URL"] ?? "";
-  const rawToken = process.env["WHATSAPP_BRIDGE_TOKEN"] ?? "";
-  const url = rawUrl.trim().replace(/^['"]|['"]$/g, "").replace(/\/+$/, "");
-  const token = rawToken
+function clean(value: string | undefined): string {
+  return (value ?? "")
     .trim()
-    .replace(/^WHATSAPP_BRIDGE_TOKEN\s*=\s*/i, "")
-    .replace(/^BRIDGE_TOKEN\s*=\s*/i, "")
+    .replace(/^[A-Z_]+\s*=\s*/i, "")
     .replace(/^['"]|['"]$/g, "")
     .trim();
-  return { url, token };
 }
 
-function bridgeHeaders(token: string): Record<string, string> {
-  return {
-    Authorization: `Bearer ${token}`,
-    "X-Bridge-Token": token,
-  };
+function evoConfig() {
+  const url = clean(process.env["WHATSAPP_API_URL"]).replace(/\/+$/, "");
+  const key = clean(process.env["WHATSAPP_API_KEY"]);
+  const instance = clean(process.env["WHATSAPP_INSTANCE"]) || "mithra2";
+  return { url, key, instance };
 }
 
-/** إرسال عبر جسر واتساب المجاني على الـVPS (رقمك الشخصي/رقم الشركة). */
-async function bridgeSend(to: string, body: string): Promise<TwilioResult | null> {
-  const { url, token } = normalizeBridgeConfig();
-  if (!url || !token) return null;
+async function evoFetch(
+  path: string,
+  init: RequestInit & { json?: unknown } = {},
+): Promise<{ status: number; data: any; text: string }> {
+  const { url, key } = evoConfig();
+  const { json, ...rest } = init;
+  const res = await fetch(`${url}${path}`, {
+    ...rest,
+    headers: {
+      apikey: key,
+      "Content-Type": "application/json",
+      ...(rest.headers as Record<string, string> | undefined),
+    },
+    ...(json !== undefined ? { body: JSON.stringify(json) } : {}),
+  });
+  const text = await res.text().catch(() => "");
+  let data: any = null;
   try {
-    const res = await fetch(`${url}/send`, {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = null;
+  }
+  return { status: res.status, data, text };
+}
+
+/** ينشئ الـ instance إن لم تكن موجودة. */
+async function cloudEnsureInstance(): Promise<void> {
+  const { instance } = evoConfig();
+  const state = await evoFetch(`/instance/connectionState/${instance}`);
+  if (state.status === 200) return;
+  await evoFetch(`/instance/create`, {
+    method: "POST",
+    json: { instanceName: instance, integration: "WHATSAPP-BAILEYS", qrcode: true },
+  });
+}
+
+function evoNumber(raw: string): string {
+  return toE164(raw).replace(/^\+/, "");
+}
+
+async function evoSend(to: string, body: string): Promise<TwilioResult | null> {
+  const { url, key, instance } = evoConfig();
+  if (!url || !key) return null;
+  try {
+    await cloudEnsureInstance();
+    const number = evoNumber(to);
+    let res = await evoFetch(`/message/sendText/${instance}`, {
       method: "POST",
-      headers: { ...bridgeHeaders(token), "Content-Type": "application/json" },
-      body: JSON.stringify({ to: toE164(to), body }),
+      json: { number, text: body },
     });
-    const data = (await res.json().catch(() => ({}))) as { ok?: boolean; id?: string; error?: string };
-    if (res.ok && data.ok) return { ok: true, sid: data.id ?? "" };
-    return { ok: false, error: data.error ?? `Bridge ${res.status}` };
+    if (res.status >= 400) {
+      // توافق مع الإصدارات الأقدم من Evolution
+      res = await evoFetch(`/message/sendText/${instance}`, {
+        method: "POST",
+        json: { number, textMessage: { text: body } },
+      });
+    }
+    if (res.status < 400) {
+      const id = res.data?.key?.id ?? res.data?.messageId ?? "";
+      return { ok: true, sid: String(id) };
+    }
+    const msg =
+      res.status === 401 || res.status === 403
+        ? "مفتاح خدمة واتساب غير صحيح"
+        : (res.data?.message ?? res.data?.error ?? res.text.slice(0, 200) ?? `Evolution ${res.status}`);
+    return { ok: false, error: String(msg) };
   } catch (e) {
-    return { ok: false, error: `تعذر الاتصال بجسر واتساب: ${(e as Error).message}` };
+    return { ok: false, error: `تعذر الاتصال بخدمة واتساب: ${(e as Error).message}` };
   }
 }
 
@@ -68,16 +116,16 @@ export async function twilioSend(input: {
   contentSid?: string;
   contentVariables?: Record<string, string>;
 }): Promise<TwilioResult> {
-  // الأولوية للجسر المجاني (الرقم المرتبط بالـQR)، وإن فشل نرجع لـTwilio.
+  // الأولوية لخدمة واتساب الخاصة بنا (Evolution)، وإن فشلت نرجع لـTwilio.
   if (!input.contentSid) {
-    const viaBridge = await bridgeSend(input.to, input.body);
-    if (viaBridge?.ok) return viaBridge;
+    const viaEvo = await evoSend(input.to, input.body);
+    if (viaEvo?.ok) return viaEvo;
   }
 
   const sid = process.env["TWILIO_ACCOUNT_SID"];
   const token = process.env["TWILIO_AUTH_TOKEN"];
   const from = process.env["TWILIO_WHATSAPP_FROM"] ?? "whatsapp:+17372212163";
-  if (!sid || !token) return { ok: false, error: "بيانات Twilio غير مكتملة في النظام" };
+  if (!sid || !token) return { ok: false, error: "خدمة واتساب غير مرتبطة — امسح رمز QR من صفحة ربط واتساب" };
 
   const to = toE164(input.to);
   if (!to.startsWith("+") || to.length < 8) {
@@ -116,7 +164,6 @@ export async function twilioSend(input: {
   try {
     const parsed = JSON.parse(text) as { message?: string; code?: number };
     if (parsed.message) message = `Twilio ${parsed.code ?? res.status}: ${parsed.message}`;
-    // 63016 = خارج نافذة الـ 24 ساعة → يجب استخدام قالب معتمد
     if (parsed.code === 63016) {
       return {
         ok: false,
@@ -159,59 +206,66 @@ export const sendWhatsAppMessage = createServerFn({ method: "POST" })
 export const checkTwilioConfig = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .handler(async () => {
+    const { url, key } = evoConfig();
     return {
-      configured: Boolean(process.env["TWILIO_ACCOUNT_SID"] && process.env["TWILIO_AUTH_TOKEN"]),
+      configured: Boolean(url && key) || Boolean(process.env["TWILIO_ACCOUNT_SID"] && process.env["TWILIO_AUTH_TOKEN"]),
       from: process.env["TWILIO_WHATSAPP_FROM"] ?? null,
     };
   });
 
-/** حالة ربط واتساب المجاني + رمز QR للمسح. */
+/** حالة ربط واتساب + رمز QR للمسح عبر Evolution API. */
 export const getWhatsAppLinkStatus = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .handler(async () => {
-    const { url, token } = normalizeBridgeConfig();
-    if (!url || !token) {
+    const { url, key, instance } = evoConfig();
+    if (!url || !key) {
       return { configured: false, connection: "closed" as const, qr: null, me: null, error: null };
     }
     try {
-      const res = await fetch(`${url}/status`, {
-        headers: bridgeHeaders(token),
-      });
-      const raw = await res.text().catch(() => "");
-      let data: { connection?: string; qr?: string | null; me?: string | null; error?: string | null } = {};
-      try {
-        data = raw ? JSON.parse(raw) : {};
-      } catch {
-        data = {};
-      }
-      if (!res.ok) {
-        const detail = (data.error ?? raw ?? "").toString().slice(0, 200);
+      await cloudEnsureInstance();
+
+      const state = await evoFetch(`/instance/connectionState/${instance}`);
+      if (state.status === 401 || state.status === 403) {
         return {
           configured: true,
           connection: "closed" as const,
           qr: null,
           me: null,
-          error:
-            res.status === 401 || res.status === 403
-              ? "الجسر يعمل لكنه رفض مفتاح الاتصال. أعد تشغيل خدمة واتساب من لوحة الخادم لتقرأ إعداداتها المحفوظة."
-              : `الجسر رجّع خطأ ${res.status}: ${detail}`,
+          error: "مفتاح خدمة واتساب غير صحيح — راجع قيمة WHATSAPP_API_KEY",
         };
       }
+      const raw = String(state.data?.instance?.state ?? state.data?.state ?? "close");
+      if (raw === "open") {
+        const list = await evoFetch(`/instance/fetchInstances?instanceName=${instance}`);
+        const first = Array.isArray(list.data) ? list.data[0] : null;
+        const owner: string | null =
+          first?.instance?.owner ?? first?.ownerJid ?? first?.instance?.profileName ?? null;
+        return {
+          configured: true,
+          connection: "open" as const,
+          qr: null,
+          me: owner ? String(owner).split("@")[0]! : null,
+          error: null,
+        };
+      }
+
+      const connect = await evoFetch(`/instance/connect/${instance}`);
+      const base64: string | null = connect.data?.base64 ?? connect.data?.qrcode?.base64 ?? null;
+      const qr = base64 ? (base64.startsWith("data:") ? base64 : `data:image/png;base64,${base64}`) : null;
       return {
         configured: true,
-        connection: (data.connection ?? "closed") as "open" | "connecting" | "closed",
-        qr: data.qr ?? null,
-        me: data.me ?? null,
-        error: data.error ?? null,
+        connection: (raw === "connecting" ? "connecting" : "closed") as "connecting" | "closed",
+        qr,
+        me: null,
+        error: qr ? null : (connect.data?.message ?? null),
       };
-
     } catch (e) {
       return {
         configured: true,
         connection: "closed" as const,
         qr: null,
         me: null,
-        error: `تعذر الوصول للجسر: ${(e as Error).message}`,
+        error: `تعذر الوصول لخدمة واتساب: ${(e as Error).message}`,
       };
     }
   });
@@ -220,14 +274,11 @@ export const getWhatsAppLinkStatus = createServerFn({ method: "GET" })
 export const unlinkWhatsApp = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .handler(async () => {
-    const { url, token } = normalizeBridgeConfig();
-    if (!url || !token) return { ok: false, error: "الجسر غير مُعد" };
+    const { url, key, instance } = evoConfig();
+    if (!url || !key) return { ok: false, error: "خدمة واتساب غير مُعدّة" };
     try {
-      const res = await fetch(`${url}/logout`, {
-        method: "POST",
-        headers: bridgeHeaders(token),
-      });
-      return { ok: res.ok, error: res.ok ? null : `Bridge ${res.status}` };
+      const res = await evoFetch(`/instance/logout/${instance}`, { method: "DELETE" });
+      return { ok: res.status < 400, error: res.status < 400 ? null : `Evolution ${res.status}` };
     } catch (e) {
       return { ok: false, error: (e as Error).message };
     }
